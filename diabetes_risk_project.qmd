@@ -1,0 +1,1417 @@
+
+
+# Project Overview
+
+
+1. **RQ1 — Multiclass risk prediction:** Which model best predicts whether a patient has Low, Moderate, or High diabetes risk using demographic, clinical, lifestyle, and medical-history information?
+2. **RQ2 — Risk score estimation:** How accurately can the continuous diabetes risk score be estimated from the underlying patient information?
+3. **RQ3 — Low-cost screening:** Can High diabetes risk be identified using only demographic, lifestyle, and non-laboratory information?
+4. **RQ4 — Incremental value of clinical tests:** Do laboratory and clinical biomarkers materially improve High-risk prediction compared with a lifestyle-only screening model?
+5. **RQ5 — Patient segmentation:** Can patients be segmented into meaningful groups based on demographic, lifestyle, family-history, and clinical characteristics, and do these groups exhibit different levels of diabetes risk?
+
+# Section 1 — Setup and Data Loading
+
+
+```{python}
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    silhouette_score
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    ExtraTreesClassifier,
+    RandomForestRegressor,
+    ExtraTreesRegressor
+)
+from sklearn.cluster import KMeans
+
+RANDOM_STATE = 42
+pd.set_option("display.max_columns", 100)
+pd.set_option("display.width", 160)
+
+DATA_PATH = Path("diabetes_risk_prediction_dataset.csv")
+
+if not DATA_PATH.exists():
+    raise FileNotFoundError(
+        "Dataset not found. Put diabetes_risk_prediction_dataset.csv "
+        "in the same folder as this QMD file."
+    )
+
+df = pd.read_csv(DATA_PATH)
+
+print("Dataset shape:", df.shape)
+display(df.head())
+```
+
+## 1.1 Data Structure and Missing Values
+
+```{python}
+summary = pd.DataFrame({
+    "Data_Type": df.dtypes.astype(str),
+    "Missing_Count": df.isna().sum(),
+    "Missing_Percent": (df.isna().mean() * 100).round(2),
+    "Unique_Values": df.nunique(dropna=False)
+}).sort_values("Missing_Percent", ascending=False)
+
+display(summary)
+
+print("\nDiabetes Risk Distribution:")
+display(df["Diabetes_Risk"].value_counts().to_frame("Count"))
+
+display(
+    (df["Diabetes_Risk"].value_counts(normalize=True) * 100)
+    .round(2)
+    .to_frame("Percent")
+)
+```
+
+## 1.2 Leakage Check
+
+
+```{python}
+print("Risk score by diabetes-risk category:")
+display(
+    df.groupby("Diabetes_Risk")["Diabetes_Risk_Score"]
+      .agg(["count", "mean", "min", "max"])
+      .round(2)
+)
+
+print("\nDoctor consultation need by diabetes-risk category:")
+display(
+    pd.crosstab(
+        df["Diabetes_Risk"],
+        df["Doctor_Consultation_Needed"],
+        normalize="index"
+    ).round(3)
+)
+```
+
+Data Leakage Assessment:
+Diabetes Risk Score was excluded from the diabetes-risk classification models because its ranges perfectly corresponded to the target categories. Low-risk patients had scores of 13–34, moderate-risk patients 35–64, and high-risk patients 65–100, with no overlap between categories. Doctor Consultation Needed was also excluded because all high-risk patients were marked as requiring consultation, suggesting that this variable may be a downstream decision based on the risk assessment. Including these variables would therefore artificially inflate predictive performance.
+
+
+
+# Section 2 — Reusable Modeling Functions
+
+These helper functions keep the five research sections consistent. Numeric variables are median-imputed and standardized. Categorical variables are most-frequent-imputed and one-hot encoded.
+
+```{python}
+def build_preprocessor(X, scale_numeric=True):
+    numeric_features = X.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=np.number).columns.tolist()
+
+    if scale_numeric:
+        numeric_pipeline = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ])
+    else:
+        numeric_pipeline = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median"))
+        ])
+
+    categorical_pipeline = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", min_frequency=10))
+    ])
+
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_features),
+            ("categorical", categorical_pipeline, categorical_features)
+        ]
+    )
+
+
+def classification_benchmark(X, y, multiclass=False, selection_metric=None):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        stratify=y
+    )
+
+    models = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            solver="lbfgs"
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=250,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+            min_samples_leaf=2
+        ),
+        "Extra Trees": ExtraTreesClassifier(
+            n_estimators=250,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            class_weight="balanced",
+            min_samples_leaf=2
+        )
+    }
+
+    rows = []
+    fitted_models = {}
+
+    for name, model in models.items():
+        pipe = Pipeline(steps=[
+            ("preprocessor", build_preprocessor(X, scale_numeric=True)),
+            ("model", model)
+        ])
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+
+        if multiclass:
+            proba = pipe.predict_proba(X_test)
+            auc = roc_auc_score(
+                y_test,
+                proba,
+                multi_class="ovr",
+                average="weighted",
+                labels=pipe.named_steps["model"].classes_
+            )
+            rows.append({
+                "Model": name,
+                "Accuracy": accuracy_score(y_test, pred),
+                "Macro_F1": f1_score(y_test, pred, average="macro"),
+                "Weighted_F1": f1_score(y_test, pred, average="weighted"),
+                "Weighted_ROC_AUC": auc
+            })
+        else:
+            proba = pipe.predict_proba(X_test)[:, 1]
+            rows.append({
+                "Model": name,
+                "Accuracy": accuracy_score(y_test, pred),
+                "Precision": precision_score(y_test, pred, zero_division=0),
+                "Recall": recall_score(y_test, pred, zero_division=0),
+                "F1": f1_score(y_test, pred, zero_division=0),
+                "ROC_AUC": roc_auc_score(y_test, proba)
+            })
+
+        fitted_models[name] = pipe
+
+    results = pd.DataFrame(rows)
+
+    if selection_metric is None:
+        sort_col = "Macro_F1" if multiclass else "ROC_AUC"
+    else:
+        sort_col = selection_metric
+
+    results = results.sort_values(
+        sort_col,
+        ascending=False
+    ).reset_index(drop=True)
+
+    best_name = results.loc[0, "Model"]
+    best_model = fitted_models[best_name]
+
+    return results, best_name, best_model, X_train, X_test, y_train, y_test
+
+
+def regression_benchmark(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.20,
+        random_state=RANDOM_STATE
+    )
+
+    models = {
+        "Random Forest": RandomForestRegressor(
+            n_estimators=250,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            min_samples_leaf=2
+        ),
+        "Extra Trees": ExtraTreesRegressor(
+            n_estimators=250,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            min_samples_leaf=2
+        )
+    }
+
+    rows = []
+    fitted_models = {}
+
+    for name, model in models.items():
+        pipe = Pipeline(steps=[
+            ("preprocessor", build_preprocessor(X, scale_numeric=False)),
+            ("model", model)
+        ])
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+
+        rows.append({
+            "Model": name,
+            "MAE": mean_absolute_error(y_test, pred),
+            "RMSE": np.sqrt(mean_squared_error(y_test, pred)),
+            "R2": r2_score(y_test, pred)
+        })
+        fitted_models[name] = pipe
+
+    results = pd.DataFrame(rows).sort_values("R2", ascending=False).reset_index(drop=True)
+    best_name = results.loc[0, "Model"]
+    best_model = fitted_models[best_name]
+
+    return results, best_name, best_model, X_train, X_test, y_train, y_test
+
+
+def get_feature_importance(fitted_pipeline, top_n=20):
+    preprocessor = fitted_pipeline.named_steps["preprocessor"]
+    model = fitted_pipeline.named_steps["model"]
+
+    feature_names = preprocessor.get_feature_names_out()
+
+    if hasattr(model, "feature_importances_"):
+        importance = model.feature_importances_
+    elif hasattr(model, "coef_"):
+        coef = model.coef_
+        importance = np.mean(np.abs(coef), axis=0) if coef.ndim == 2 else np.abs(coef)
+    else:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "Feature": feature_names,
+        "Importance": importance
+    }).sort_values("Importance", ascending=False)
+
+    return out.head(top_n).reset_index(drop=True)
+```
+
+# Section 3 — RQ1: Predict Low, Moderate, and High Diabetes Risk
+
+## Research Question
+
+**Which model best predicts the three diabetes-risk categories from demographic, clinical, lifestyle, and medical-history information?**
+
+This is a **multiclass classification** problem. Because the Low-risk group is much smaller than the other groups, **Macro F1** is used as the primary model-selection metric rather than accuracy alone. Macro F1 gives each risk class equal importance.
+
+The three downstream fields `Diabetes_Risk_Score`, `AI_Health_Recommendation`, and `Doctor_Consultation_Needed` are deliberately excluded to prevent leakage.
+
+```{python}
+leakage_columns = [
+    "Patient_ID",
+    "Diabetes_Risk",
+    "Diabetes_Risk_Score",
+    "AI_Health_Recommendation",
+    "Doctor_Consultation_Needed"
+]
+
+X_rq1 = df.drop(columns=leakage_columns)
+y_rq1 = df["Diabetes_Risk"]
+
+rq1_results, rq1_best_name, rq1_best_model, X1_train, X1_test, y1_train, y1_test = (
+    classification_benchmark(X_rq1, y_rq1, multiclass=True)
+)
+
+print("RQ1 model comparison:")
+display(rq1_results.round(4))
+print("Best model based on Macro F1:", rq1_best_name)
+```
+
+Random Forest achieved the strongest overall predictive performance, with the highest accuracy (0.9023), weighted F1 (0.8941), and weighted ROC AUC (0.9705). However, Logistic Regression achieved the highest macro F1 score (0.6821), indicating more balanced performance across the three diabetes-risk categories. Given the severe class imbalance, particularly the small number of low-risk observations, Logistic Regression was selected as the preferred model when equal performance across risk categories was prioritized.
+
+
+
+## Best Model Evaluation
+
+```{python}
+rq1_pred = rq1_best_model.predict(X1_test)
+
+print(classification_report(y1_test, rq1_pred, digits=4))
+
+cm1 = confusion_matrix(
+    y1_test,
+    rq1_pred,
+    labels=["Low", "Moderate", "High"]
+)
+
+cm1_df = pd.DataFrame(
+    cm1,
+    index=["Actual Low", "Actual Moderate", "Actual High"],
+    columns=["Predicted Low", "Predicted Moderate", "Predicted High"]
+)
+
+display(cm1_df)
+```
+
+Logistic Regression achieved the highest Macro F1 score of 0.6821, indicating the most balanced performance across the three risk categories. Its strongest performance was observed for high-risk patients, with an F1-score of 0.9049. The model also achieved very high recall for the rare low-risk group, correctly identifying 85 of the 94 low-risk patients, corresponding to a recall of 90.43%. However, low-risk precision was only 26.90%. Among the 316 patients predicted as low risk, only 85 were truly low risk, while 229 were actually moderate risk and 2 were high risk. This indicates a clear precision-recall trade-off: the model captures most true low-risk patients, but it also incorrectly assigns many higher-risk patients to the low-risk category. In a healthcare setting, this could potentially underestimate the risk of some patients and delay further assessment. Therefore, the model may be useful for screening, but low-risk predictions should be interpreted cautiously rather than treated as definitive clinical decisions.
+
+
+## Most Important Predictors
+
+```{python}
+rq1_importance = get_feature_importance(rq1_best_model, top_n=20)
+display(rq1_importance)
+
+if not rq1_importance.empty:
+    plot_data = rq1_importance.sort_values("Importance")
+    plt.figure(figsize=(9, 7))
+    plt.barh(plot_data["Feature"], plot_data["Importance"])
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    plt.title("RQ1: Most Important Predictors of Diabetes Risk")
+    plt.tight_layout()
+    plt.show()
+```
+
+Feature importance analysis shows that Fasting Blood Sugar was the most influential predictor (2.092), followed by HbA1c (1.698) and a family history of diabetes (1.603). These results suggest that clinical glycemic indicators provide particularly strong information for distinguishing among diabetes risk categories. However, the model also relied on several non-laboratory characteristics, including poor diet quality, hypertension, age, current smoking, high stress, and low physical activity. This indicates that diabetes-risk prediction is not driven solely by laboratory measurements; lifestyle, family history, and existing health conditions also contribute meaningful predictive information. BMI showed a lower importance (0.768) after the other predictors were considered, suggesting that its additional predictive contribution was smaller in this multivariable model. Importantly, these importance values represent predictive influence rather than causal effects, so they should not be interpreted as evidence that a particular feature directly causes diabetes risk.
+
+
+### Interpretation Guidance
+
+A strong Macro F1 would indicate that the model can distinguish all three risk groups rather than simply favoring the dominant High-risk class. The feature-importance table can be used to discuss whether laboratory biomarkers, body composition, family history, or lifestyle variables are the strongest predictors.
+
+
+
+# Section 4 — RQ2: Predict the Continuous Diabetes Risk Score
+
+## Research Question
+
+**How accurately can the continuous `Diabetes_Risk_Score` be estimated from the underlying patient characteristics?**
+
+This is a **regression** problem. The final categorical risk, recommendation, and consultation fields are excluded because they are likely downstream consequences of the score. The primary metric is **R²**, with MAE and RMSE reported for error magnitude.
+
+```{python}
+rq2_exclude = [
+    "Patient_ID",
+    "Diabetes_Risk_Score",
+    "Diabetes_Risk",
+    "AI_Health_Recommendation",
+    "Doctor_Consultation_Needed"
+]
+
+X_rq2 = df.drop(columns=rq2_exclude)
+y_rq2 = df["Diabetes_Risk_Score"]
+
+rq2_results, rq2_best_name, rq2_best_model, X2_train, X2_test, y2_train, y2_test = (
+    regression_benchmark(X_rq2, y_rq2)
+)
+
+print("RQ2 model comparison:")
+display(rq2_results.round(4))
+print("Best model based on R2:", rq2_best_name)
+```
+
+
+Extra Trees was selected as the best model for predicting the continuous Diabetes Risk Score, achieving the highest R² of 0.8740. This indicates that approximately 87.4% of the variation in risk scores in the test set could be explained by the predictors included in the model. The model achieved an MAE of 4.37, meaning that its predicted risk scores differed from the actual scores by approximately 4.37 points on average. Its RMSE of 5.52 suggests that some larger prediction errors remained. Random Forest also performed strongly, with an R² of 0.8625, but Extra Trees showed a small and consistent advantage through a higher R² and lower MAE and RMSE. Unlike the categorical prediction in RQ1, this analysis provides a more granular estimate of individual risk severity within the Low, Moderate, and High risk categories.
+
+
+## Best Model Evaluation
+
+```{python}
+rq2_pred = rq2_best_model.predict(X2_test)
+
+rq2_eval = pd.DataFrame({
+    "Metric": ["MAE", "RMSE", "R2"],
+    "Value": [
+        mean_absolute_error(y2_test, rq2_pred),
+        np.sqrt(mean_squared_error(y2_test, rq2_pred)),
+        r2_score(y2_test, rq2_pred)
+    ]
+})
+
+display(rq2_eval.round(4))
+
+plt.figure(figsize=(7, 6))
+plt.scatter(y2_test, rq2_pred, alpha=0.25)
+plt.xlabel("Actual Diabetes Risk Score")
+plt.ylabel("Predicted Diabetes Risk Score")
+plt.title("RQ2: Actual vs Predicted Risk Score")
+plt.tight_layout()
+plt.show()
+```
+
+The Actual vs. Predicted plot shows a strong positive alignment between observed and predicted Diabetes Risk Scores, supporting the Extra Trees model's R² of 0.8740. Most observations are concentrated around the expected diagonal relationship, indicating that the model successfully captures differences in risk severity across patients. Predictions are particularly dense and consistent in the moderate-to-high score range. However, some observations deviate substantially from the main pattern, showing that individual-level prediction errors and outliers remain. The model also appears to pull some extreme observations toward the middle of the score distribution, with very low scores occasionally being overpredicted and very high scores slightly underpredicted. This pattern is consistent with the MAE of 4.37 and the higher RMSE of 5.52, since RMSE penalizes the relatively small number of larger prediction errors more heavily. Overall, the model provides strong risk-score predictions but should not be interpreted as producing exact scores for every individual patient.
+
+## Most Important Predictors
+
+```{python}
+rq2_importance = get_feature_importance(rq2_best_model, top_n=20)
+display(rq2_importance)
+```
+
+The Extra Trees feature importance results show that Fasting Blood Sugar (0.2705) was the most influential predictor of the continuous Diabetes Risk Score, followed by HbA1c (0.1615). Together, these two glycemic indicators accounted for a substantial share of the model's predictive importance. Age (0.0733), family history of diabetes, and BMI (0.0436) also provided meaningful predictive information. Lifestyle-related factors, including poor diet quality, low physical activity, current smoking, high stress, and frequent alcohol consumption, contributed to the prediction but were individually less influential than the major glycemic indicators. Importantly, Fasting Blood Sugar and HbA1c were also the two leading predictors in RQ1, demonstrating consistency across both the classification and regression analyses. Overall, the findings suggest that clinical biomarkers provide the strongest predictive information, while demographic, family-history, physical, and lifestyle characteristics provide additional information for estimating diabetes risk severity.
+
+These feature importance values describe predictive contribution within the Extra Trees model and should not be interpreted as causal effects.
+
+
+### Interpretation Guidance
+
+This question is useful because it tests whether the numerical score can be reconstructed from the raw patient information. A very high R² may suggest that the score is strongly formula-driven by variables already present in the dataset. This should be described as **predictive reconstruction**, not as proof of a causal relationship.
+
+
+
+# Section 5 — RQ3: Can High Risk Be Identified Without Laboratory Tests?
+
+## Research Question
+
+**Can High diabetes risk be identified using demographic, lifestyle, and non-laboratory information only?**
+
+This question represents a lower-cost screening scenario. It deliberately removes blood glucose, HbA1c, fasting blood sugar, insulin, cholesterol, and other laboratory measurements. The target is converted into a binary outcome: **High risk = 1; Low or Moderate risk = 0**.
+
+The primary metric is **Recall**, while recall is especially important because missing a truly High-risk patient may be more consequential than producing a false positive in an initial screening setting.
+
+```{python}
+lifestyle_features = [
+    "Age",
+    "Gender",
+    "Country",
+    "Height_cm",
+    "Weight_kg",
+    "BMI",
+    "Waist_Circumference_cm",
+    "Physical_Activity_Level",
+    "Exercise_Hours_Per_Week",
+    "Daily_Walking_Minutes",
+    "Diet_Quality",
+    "Sugar_Intake_Level",
+    "Sleep_Hours",
+    "Stress_Level",
+    "Smoking_Status",
+    "Alcohol_Consumption",
+    "Family_History_Diabetes",
+    "Hypertension",
+    "Heart_Disease",
+    "Fatty_Liver",
+    "PCOS",
+    "Medication_Adherence",
+    "Work_Type",
+    "Residence_Type",
+    "Daily_Water_Intake_L"
+]
+
+X_rq3 = df[lifestyle_features].copy()
+y_rq3 = (df["Diabetes_Risk"] == "High").astype(int)
+
+rq3_results, rq3_best_name, rq3_best_model, X3_train, X3_test, y3_train, y3_test = (
+    classification_benchmark(
+        X_rq3,
+        y_rq3,
+        multiclass=False,
+        selection_metric="Recall"
+    )
+)
+
+print("RQ3 model comparison:")
+display(rq3_results.round(4))
+
+print("Best model based on Recall:", rq3_best_name)
+```
+
+Random Forest was selected as the best model for lifestyle-only high-risk screening because it achieved the highest recall of 0.9273. This means that approximately 92.73% of actual high-risk individuals were successfully identified without relying on major laboratory biomarkers such as fasting blood sugar or HbA1c. The model also achieved the highest accuracy (0.7838) and F1-score (0.8626). However, its precision of 0.8063 was lower than Logistic Regression's 0.8854, indicating that the higher sensitivity came at the cost of more false-positive high-risk classifications. Logistic Regression also achieved the highest ROC AUC (0.8189), suggesting slightly stronger overall discrimination across classification thresholds. Nevertheless, because the purpose of this analysis is preliminary screening, recall was prioritized to reduce the number of high-risk individuals who would be missed. Therefore, the Random Forest model is more suitable as a screening tool for identifying individuals who may benefit from further clinical testing rather than as a definitive diagnostic model.
+
+
+
+## Best Lifestyle-Only Screening Model
+
+```{python}
+rq3_pred = rq3_best_model.predict(X3_test)
+rq3_prob = rq3_best_model.predict_proba(X3_test)[:, 1]
+
+print(classification_report(y3_test, rq3_pred, digits=4))
+
+rq3_importance = get_feature_importance(rq3_best_model, top_n=20)
+display(rq3_importance)
+```
+
+
+Random Forest demonstrated strong performance for lifestyle-only high-risk screening, achieving a recall of 0.9273 for the high-risk class. This means that approximately 93% of actual high-risk individuals were successfully identified without using major laboratory biomarkers. However, this high sensitivity came with a trade-off: recall for the non-high-risk group was only 0.3920, indicating that many low- or moderate-risk individuals were incorrectly flagged as high risk. Therefore, the model is more appropriate as an initial screening tool designed to minimize missed high-risk cases than as a definitive diagnostic system.
+
+When laboratory biomarkers were excluded, age became the most important predictor, followed by BMI, weight, height, daily walking time, waist circumference, sleep duration, exercise, and family history of diabetes. This suggests that demographic, anthropometric, lifestyle, and family-history information can still provide meaningful signals for identifying potentially high-risk individuals. However, correlated variables such as BMI, weight, and height may share predictive information, so their individual importance rankings should be interpreted cautiously. Overall, the results suggest that lifestyle-based screening could help identify individuals for further clinical testing, but its relatively high false-positive rate limits its use as a standalone diagnostic approach.
+
+
+### Interpretation Guidance
+
+If the lifestyle-only model performs well, the dataset supports the idea that a useful preliminary screening tool may be possible without laboratory testing. If its performance is much lower than the full clinical model in RQ4, then non-laboratory screening should be viewed as preliminary rather than diagnostic.
+
+
+
+
+# Section 6 — RQ4: Do Clinical Biomarkers Add Meaningful Predictive Value?
+
+## Research Question
+
+**How much predictive value is gained when clinical and laboratory biomarkers are added to the lifestyle-only screening model?**
+
+This is a direct comparison between two information settings:
+
+- **Lifestyle-only model:** demographic, anthropometric, lifestyle, and medical-history variables.
+- **Full clinical model:** the same variables plus laboratory and cardiovascular measurements.
+
+Both versions predict the same binary High-risk outcome. Comparing ROC AUC, F1, and recall provides a more balanced answer than assuming more medical tests must automatically produce a better model.
+
+
+```{python}
+# ============================================================
+# RQ4: Lifestyle-Only vs. Lifestyle + Clinical Information
+# Model selection criterion: Recall
+# ============================================================
+
+y_rq4 = (df["Diabetes_Risk"] == "High").astype(int)
+
+# Full feature set: lifestyle/non-lab features + clinical variables
+clinical_features = [
+    "Fasting_Blood_Sugar",
+    "HbA1c",
+    "Blood_Pressure_Systolic",
+    "Blood_Pressure_Diastolic",
+    "Total_Cholesterol",
+    "HDL_Cholesterol",
+    "LDL_Cholesterol",
+    "Triglycerides"
+]
+
+full_features = lifestyle_features + [
+    col for col in clinical_features
+    if col in df.columns and col not in lifestyle_features
+]
+
+print("Number of lifestyle/non-lab features:", len(lifestyle_features))
+print("Number of lifestyle + clinical features:", len(full_features))
+
+
+```
+
+
+```{python}
+# Benchmark lifestyle-only models
+rq4_life_results, rq4_life_best_name, rq4_life_best_model, _, _, _, _ = (
+    classification_benchmark(
+        df[lifestyle_features],
+        y_rq4,
+        multiclass=False,
+        selection_metric="Recall"
+    )
+)
+
+# Benchmark lifestyle + clinical models
+rq4_full_results, rq4_full_best_name, rq4_full_best_model, _, _, _, _ = (
+    classification_benchmark(
+        df[full_features],
+        y_rq4,
+        multiclass=False,
+        selection_metric="Recall"
+    )
+)
+
+print("Lifestyle-only model comparison:")
+display(rq4_life_results.round(4))
+
+print("Best lifestyle-only model based on Recall:", rq4_life_best_name)
+
+print("\nLifestyle + clinical model comparison:")
+display(rq4_full_results.round(4))
+
+print("Best lifestyle + clinical model based on Recall:", rq4_full_best_name)
+
+
+```
+
+
+```{python}
+
+# Extract the best model from each feature set
+life_best = rq4_life_results[
+    rq4_life_results["Model"] == rq4_life_best_name
+].iloc[0]
+
+full_best = rq4_full_results[
+    rq4_full_results["Model"] == rq4_full_best_name
+].iloc[0]
+
+# Create comparison table
+rq4_comparison = pd.DataFrame([
+    {
+        "Feature_Set": "Lifestyle / Non-Lab Only",
+        "Best_Model": rq4_life_best_name,
+        "Accuracy": life_best["Accuracy"],
+        "Precision": life_best["Precision"],
+        "Recall": life_best["Recall"],
+        "F1": life_best["F1"],
+        "ROC_AUC": life_best["ROC_AUC"]
+    },
+    {
+        "Feature_Set": "Lifestyle + Clinical",
+        "Best_Model": rq4_full_best_name,
+        "Accuracy": full_best["Accuracy"],
+        "Precision": full_best["Precision"],
+        "Recall": full_best["Recall"],
+        "F1": full_best["F1"],
+        "ROC_AUC": full_best["ROC_AUC"]
+    }
+])
+
+print("RQ4 comparison:")
+display(rq4_comparison.round(4))
+
+```
+
+
+```{python}
+
+# Calculate performance improvements after adding clinical variables
+recall_improvement = (
+    full_best["Recall"] - life_best["Recall"]
+)
+
+roc_auc_improvement = (
+    full_best["ROC_AUC"] - life_best["ROC_AUC"]
+)
+
+accuracy_improvement = (
+    full_best["Accuracy"] - life_best["Accuracy"]
+)
+
+f1_improvement = (
+    full_best["F1"] - life_best["F1"]
+)
+
+print(
+    "Recall improvement from adding clinical variables:",
+    round(recall_improvement, 4)
+)
+
+print(
+    "ROC AUC improvement from adding clinical variables:",
+    round(roc_auc_improvement, 4)
+)
+
+print(
+    "Accuracy improvement from adding clinical variables:",
+    round(accuracy_improvement, 4)
+)
+
+print(
+    "F1 improvement from adding clinical variables:",
+    round(f1_improvement, 4)
+)
+
+```
+
+Random Forest was selected as the best model for both feature sets based on recall, allowing a consistent comparison of screening performance. Using lifestyle and non-laboratory information alone, the model achieved a recall of 0.9273, indicating that approximately 92.73% of actual high-risk individuals were successfully identified. After adding clinical variables, recall increased to 0.9773, representing a 5.00 percentage-point improvement. In practical terms, among 1,000 truly high-risk individuals, the lifestyle-only model would identify approximately 927, whereas the model incorporating clinical information would identify approximately 977.
+
+Importantly, the improvement in recall was accompanied by improvements in other metrics. Precision increased from 0.8063 to 0.9176, accuracy from 0.7838 to 0.9192, F1-score from 0.8626 to 0.9465, and ROC AUC from 0.8058 to 0.9754. This indicates that clinical variables improve not only sensitivity but also overall classification quality. The findings suggest that lifestyle and non-laboratory information may be useful for initial high-risk screening, while clinical measurements provide substantial additional value for more accurate diabetes risk assessment.
+
+
+
+## Clinical Model Feature Importance
+
+```{python}
+rq4_importance = get_feature_importance(rq4_full_best_model, top_n=25)
+display(rq4_importance)
+```
+
+### Interpretation Guidance
+
+This question gives the project a more critical comparison. If the full model produces a large improvement, clinical testing contributes substantial predictive information. If the improvement is small, the dataset suggests that lower-cost screening variables already capture much of the predictive signal. The conclusion should focus on **predictive value**, not medical causality.
+
+
+
+
+# Section 7 — RQ5: Patient Segmentation and Diabetes Risk Profiles
+
+## Research Question
+
+**Can patients be segmented into meaningful groups based on demographic, lifestyle, family-history, and clinical characteristics, and do these groups exhibit different levels of diabetes risk?**
+
+The clustering process does not use Diabetes_Risk, Diabetes_Risk_Score, or downstream recommendation variables. Diabetes risk is examined only after the clusters have been created.
+
+# 7.1 Select Patient Characteristics for Clustering
+
+```{python}
+# RQ5: Patient Segmentation Based on Patient Characteristics
+
+cluster_features = [
+    "Age",
+    "BMI",
+    "Waist_Circumference_cm",
+    "Fasting_Blood_Sugar",
+    "HbA1c",
+    "Blood_Pressure_Systolic",
+    "Blood_Pressure_Diastolic",
+    "Total_Cholesterol",
+    "HDL_Cholesterol",
+    "LDL_Cholesterol",
+    "Triglycerides",
+    "Exercise_Hours_Per_Week",
+    "Daily_Walking_Minutes",
+    "Sleep_Hours",
+    "Daily_Water_Intake_L",
+    "Physical_Activity_Level",
+    "Diet_Quality",
+    "Smoking_Status",
+    "Alcohol_Consumption",
+    "Stress_Level",
+    "Family_History_Diabetes",
+    "Hypertension",
+    "Heart_Disease",
+    "Fatty_Liver",
+    "PCOS"
+]
+
+# Keep only columns that actually exist in the dataset
+cluster_features = [
+    col for col in cluster_features
+    if col in df.columns
+]
+
+X_cluster = df[cluster_features].copy()
+
+print("Number of clustering features:", len(cluster_features))
+print("\nFeatures used for clustering:")
+for feature in cluster_features:
+    print("-", feature)
+
+print("\nImportant:")
+print("Diabetes_Risk is NOT used to create the clusters.")
+print("Diabetes_Risk_Score is NOT used to create the clusters.")
+
+
+```
+
+# 7.2 Preprocess Patient Characteristics
+```{python}
+
+# Separate numerical and categorical variables
+cluster_numeric = X_cluster.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+cluster_categorical = X_cluster.select_dtypes(
+    exclude=np.number
+).columns.tolist()
+
+print("Numerical features:", len(cluster_numeric))
+print("Categorical features:", len(cluster_categorical))
+
+
+# Numerical preprocessing
+numeric_cluster_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+
+# Categorical preprocessing
+categorical_cluster_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    (
+        "onehot",
+        OneHotEncoder(
+            handle_unknown="ignore",
+            drop="if_binary"
+        )
+    )
+])
+
+
+# Combine preprocessing
+cluster_preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "numeric",
+            numeric_cluster_pipeline,
+            cluster_numeric
+        ),
+        (
+            "categorical",
+            categorical_cluster_pipeline,
+            cluster_categorical
+        )
+    ]
+)
+
+
+# Transform patient characteristics
+X_cluster_processed = cluster_preprocessor.fit_transform(
+    X_cluster
+)
+
+# Convert sparse matrix if necessary
+if hasattr(X_cluster_processed, "toarray"):
+    X_cluster_processed = X_cluster_processed.toarray()
+
+print(
+    "Processed clustering data shape:",
+    X_cluster_processed.shape
+)
+
+```
+
+
+# 7.3 Compare Different Numbers of Patient Clusters
+```{python}
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+cluster_evaluation = []
+
+for k in range(2, 7):
+
+    kmeans = KMeans(
+        n_clusters=k,
+        random_state=RANDOM_STATE,
+        n_init=20
+    )
+
+    labels = kmeans.fit_predict(
+        X_cluster_processed
+    )
+
+    silhouette = silhouette_score(
+        X_cluster_processed,
+        labels,
+        sample_size=min(
+            10000,
+            len(X_cluster_processed)
+        ),
+        random_state=RANDOM_STATE
+    )
+
+    cluster_evaluation.append({
+        "Number_of_Clusters": k,
+        "Silhouette_Score": silhouette
+    })
+
+
+cluster_evaluation = pd.DataFrame(
+    cluster_evaluation
+)
+
+print("Clustering evaluation:")
+display(
+    cluster_evaluation.round(4)
+)
+
+```
+
+
+# 7.4 Visualize Silhouette Scores
+```{python}
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    cluster_evaluation["Number_of_Clusters"],
+    cluster_evaluation["Silhouette_Score"],
+    marker="o"
+)
+
+plt.xlabel("Number of Clusters (k)")
+plt.ylabel("Silhouette Score")
+plt.title(
+    "Silhouette Score by Number of Patient Clusters"
+)
+
+plt.xticks(
+    cluster_evaluation["Number_of_Clusters"]
+)
+
+plt.grid(alpha=0.3)
+
+plt.show()
+
+```
+
+# 7.5 Compare Candidate Cluster Solutions
+```{python}
+
+candidate_ks = [2, 3, 4]
+
+candidate_cluster_summary = []
+
+candidate_models = {}
+candidate_labels = {}
+
+
+for k in candidate_ks:
+
+    model = KMeans(
+        n_clusters=k,
+        random_state=RANDOM_STATE,
+        n_init=20
+    )
+
+    labels = model.fit_predict(
+        X_cluster_processed
+    )
+
+    candidate_models[k] = model
+    candidate_labels[k] = labels
+
+    temp = df.copy()
+
+    temp["Patient_Cluster"] = labels
+
+    temp["High_Risk"] = (
+        temp["Diabetes_Risk"] == "High"
+    ).astype(int)
+
+    cluster_risk = (
+        temp
+        .groupby("Patient_Cluster")
+        .agg(
+            Cluster_Size=(
+                "Patient_Cluster",
+                "size"
+            ),
+            High_Risk_Rate=(
+                "High_Risk",
+                "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    risk_range = (
+        cluster_risk["High_Risk_Rate"].max()
+        -
+        cluster_risk["High_Risk_Rate"].min()
+    )
+
+    silhouette = cluster_evaluation.loc[
+        cluster_evaluation[
+            "Number_of_Clusters"
+        ] == k,
+        "Silhouette_Score"
+    ].iloc[0]
+
+    candidate_cluster_summary.append({
+        "Number_of_Clusters": k,
+        "Silhouette_Score": silhouette,
+        "Lowest_High_Risk_Rate":
+            cluster_risk[
+                "High_Risk_Rate"
+            ].min(),
+        "Highest_High_Risk_Rate":
+            cluster_risk[
+                "High_Risk_Rate"
+            ].max(),
+        "Risk_Rate_Range": risk_range,
+        "Smallest_Cluster":
+            cluster_risk[
+                "Cluster_Size"
+            ].min()
+    })
+
+
+candidate_cluster_summary = pd.DataFrame(
+    candidate_cluster_summary
+)
+
+print("Candidate clustering solutions:")
+display(
+    candidate_cluster_summary.round(4)
+)
+
+```
+
+
+# 7.6 Inspect k = 2, 3, and 4 Risk Profiles
+```{python}
+
+for k in candidate_ks:
+
+    temp = df.copy()
+
+    temp["Patient_Cluster"] = (
+        candidate_labels[k]
+    )
+
+    temp["High_Risk"] = (
+        temp["Diabetes_Risk"] == "High"
+    ).astype(int)
+
+    print(
+        f"\nPatient risk profiles for k = {k}"
+    )
+
+    risk_profile = (
+        temp
+        .groupby("Patient_Cluster")
+        .agg(
+            Cluster_Size=(
+                "Patient_Cluster",
+                "size"
+            ),
+            High_Risk_Rate=(
+                "High_Risk",
+                "mean"
+            ),
+            Average_Risk_Score=(
+                "Diabetes_Risk_Score",
+                "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    display(
+        risk_profile.round(4)
+    )
+
+```
+
+# 7.7 Choose the Final Number of Clusters
+```{python}
+# Final number of clusters
+# Selected based on statistical quality and interpretability
+
+FINAL_K = 3
+
+final_kmeans = KMeans(
+    n_clusters=FINAL_K,
+    random_state=RANDOM_STATE,
+    n_init=20
+)
+
+df_clustered = df.copy()
+
+df_clustered["Patient_Cluster"] = (
+    final_kmeans.fit_predict(
+        X_cluster_processed
+    )
+)
+
+print(
+    "Final number of patient clusters:",
+    FINAL_K
+)
+
+print("\nCluster sizes:")
+
+display(
+    df_clustered[
+        "Patient_Cluster"
+    ]
+    .value_counts()
+    .sort_index()
+    .rename("Cluster_Size")
+    .to_frame()
+)
+
+
+```
+
+# 7.8 Numerical Patient Profiles
+```{python}
+
+profile_numeric_features = [
+    "Age",
+    "BMI",
+    "Waist_Circumference_cm",
+    "Fasting_Blood_Sugar",
+    "HbA1c",
+    "Blood_Pressure_Systolic",
+    "Total_Cholesterol",
+    "Exercise_Hours_Per_Week",
+    "Daily_Walking_Minutes",
+    "Sleep_Hours"
+]
+
+profile_numeric_features = [
+    col for col in profile_numeric_features
+    if col in df_clustered.columns
+]
+
+
+numerical_profiles = (
+    df_clustered
+    .groupby("Patient_Cluster")[
+        profile_numeric_features
+    ]
+    .mean()
+    .round(2)
+)
+
+print("Numerical patient profiles:")
+
+display(
+    numerical_profiles
+)
+
+```
+
+# 7.9 Categorical Patient Profiles
+```{python}
+
+profile_categorical_features = [
+    "Physical_Activity_Level",
+    "Diet_Quality",
+    "Smoking_Status",
+    "Stress_Level",
+    "Family_History_Diabetes",
+    "Hypertension",
+    "Heart_Disease",
+    "Fatty_Liver",
+    "PCOS"
+]
+
+profile_categorical_features = [
+    col for col in profile_categorical_features
+    if col in df_clustered.columns
+]
+
+
+categorical_profiles = []
+
+for cluster in sorted(
+    df_clustered["Patient_Cluster"].unique()
+):
+
+    cluster_data = df_clustered[
+        df_clustered["Patient_Cluster"]
+        == cluster
+    ]
+
+    row = {
+        "Patient_Cluster": cluster
+    }
+
+    for feature in profile_categorical_features:
+
+        mode_value = (
+            cluster_data[feature]
+            .mode()
+        )
+
+        row[
+            f"Most_Common_{feature}"
+        ] = (
+            mode_value.iloc[0]
+            if len(mode_value) > 0
+            else np.nan
+        )
+
+    categorical_profiles.append(row)
+
+
+categorical_profiles = pd.DataFrame(
+    categorical_profiles
+)
+
+print("Categorical patient profiles:")
+
+display(
+    categorical_profiles
+)
+
+```
+
+# 7.10 Diabetes Risk by Patient Cluster
+```{python}
+df_clustered["High_Risk"] = (
+    df_clustered["Diabetes_Risk"] == "High"
+).astype(int)
+
+
+risk_by_cluster = (
+    df_clustered
+    .groupby("Patient_Cluster")
+    .agg(
+        Number_of_Patients=(
+            "Patient_Cluster",
+            "size"
+        ),
+        High_Risk_Rate=(
+            "High_Risk",
+            "mean"
+        ),
+        Average_Risk_Score=(
+            "Diabetes_Risk_Score",
+            "mean"
+        )
+    )
+    .reset_index()
+)
+
+
+risk_by_cluster[
+    "Percentage_of_Dataset"
+] = (
+    risk_by_cluster[
+        "Number_of_Patients"
+    ]
+    / len(df_clustered)
+    * 100
+)
+
+
+print(
+    "Diabetes risk by patient cluster:"
+)
+
+display(
+    risk_by_cluster.round(4)
+)
+
+
+```
+
+# 7.11 Low, Moderate, and High Risk Distribution
+```{python}
+risk_distribution = pd.crosstab(
+    df_clustered["Patient_Cluster"],
+    df_clustered["Diabetes_Risk"],
+    normalize="index"
+) * 100
+
+
+# Ensure consistent column order when available
+risk_order = [
+    col for col in
+    ["Low", "Moderate", "High"]
+    if col in risk_distribution.columns
+]
+
+risk_distribution = (
+    risk_distribution[risk_order]
+    .round(2)
+)
+
+
+print(
+    "Diabetes risk distribution within each patient cluster (%):"
+)
+
+display(
+    risk_distribution
+)
+
+
+```
+
+# 7.12 Visualize High-Risk Rate by Cluster
+```{python}
+
+plt.figure(figsize=(8, 5))
+
+plt.bar(
+    risk_by_cluster[
+        "Patient_Cluster"
+    ].astype(str),
+    risk_by_cluster[
+        "High_Risk_Rate"
+    ] * 100
+)
+
+plt.xlabel("Patient Cluster")
+plt.ylabel("High-Risk Patients (%)")
+
+plt.title(
+    "High-Risk Diabetes Rate by Patient Cluster"
+)
+
+plt.ylim(0, 100)
+
+plt.show()
+
+```
+
+
+### RQ5 Analysis: Patient Segmentation and Diabetes Risk Profiles
+
+The three-cluster solution identified three broad patient profiles with different combinations of metabolic, clinical, and lifestyle characteristics. However, the relatively low Silhouette Score indicates that these clusters should be interpreted as descriptive patient profiles rather than clearly separated patient populations.
+
+**Cluster 0 – High-BMI / Metabolic Risk Profile:**
+Cluster 0 contained 13,523 patients, representing 27.05% of the dataset. This group had the highest diabetes high-risk rate at 80.38% and the highest average risk score at 77.63. Its most distinctive characteristic was a substantially higher average BMI of 43.98, compared with approximately 26 in the other two clusters. The group also had elevated fasting blood sugar and HbA1c levels. These characteristics suggest that Cluster 0 represents a high-BMI and metabolically elevated patient profile.
+
+**Cluster 1 – Hypertension / Cardiometabolic Risk Profile:**
+Cluster 1 was the largest group, containing 18,523 patients or 37.05% of the dataset. Approximately 77.00% of patients were classified as high risk, with an average diabetes risk score of 75.76. This cluster had the highest average fasting blood sugar (144.88), HbA1c (8.56), and systolic blood pressure (166.97) among the three groups. Hypertension and fatty liver were also common characteristics. Therefore, this group can be interpreted as a hypertension and cardiometabolic risk profile.
+
+**Cluster 2 – Comparatively Lower-Risk Profile:**
+Cluster 2 contained 17,954 patients, accounting for 35.91% of the dataset. It had the lowest high-risk rate at 63.84% and the lowest average risk score at 69.57. Patients in this cluster had a considerably lower average BMI of 25.95 and the lowest systolic blood pressure of 113.53. However, the group still displayed several unfavorable characteristics, including low physical activity, current smoking, high stress, and a family history of diabetes. Therefore, this cluster should not be considered a truly low-risk population; rather, it represents a comparatively lower-risk profile relative to the other two clusters.
+
+Overall, the clustering results suggest that elevated diabetes risk may occur across different patient profiles. Cluster 0 was characterized primarily by high BMI and metabolic factors, while Cluster 1 showed stronger hypertension and cardiometabolic characteristics. Cluster 2 had lower BMI and blood pressure but still contained substantial lifestyle and family-history risk factors. The high-risk rate ranged from 63.84% to 80.38% across the three groups, suggesting meaningful differences in risk prevalence despite considerable overlap between the clusters. Because the Silhouette Score was low, these results should be interpreted as broad descriptive patterns rather than evidence of three clearly distinct patient populations.
+
+
+
+# Section 8 — Consolidated Project Results
+
+This final section collects the main model choices and metrics into a compact project summary after all earlier sections have been executed.
+
+```{python}
+project_summary = pd.DataFrame([
+    {
+        "Research_Question": "RQ1: Multiclass Diabetes Risk Prediction",
+        "Task_Type": "Multiclass Classification",
+        "Best_Model": rq1_best_name,
+        "Primary_Metric": "Macro F1",
+        "Score": rq1_results.loc[
+            rq1_results["Model"] == rq1_best_name,
+            "Macro_F1"
+        ].iloc[0]
+    },
+    {
+        "Research_Question": "RQ2: Diabetes Risk Score Prediction",
+        "Task_Type": "Regression",
+        "Best_Model": rq2_best_name,
+        "Primary_Metric": "R2",
+        "Score": rq2_results.loc[
+            rq2_results["Model"] == rq2_best_name,
+            "R2"
+        ].iloc[0]
+    },
+    {
+        "Research_Question": "RQ3: High-Risk Non-Lab Screening",
+        "Task_Type": "Binary Classification",
+        "Best_Model": rq3_best_name,
+        "Primary_Metric": "Recall",
+        "Score": rq3_results.loc[
+            rq3_results["Model"] == rq3_best_name,
+            "Recall"
+        ].iloc[0]
+    },
+    {
+        "Research_Question": "RQ4: Added Value of Clinical Variables",
+        "Task_Type": "Comparative Classification",
+        "Best_Model": rq4_full_best_name,
+        "Primary_Metric": "Recall",
+        "Score": rq4_full_results.loc[
+            rq4_full_results["Model"] == rq4_full_best_name,
+            "Recall"
+        ].iloc[0]
+    },
+    {
+        "Research_Question": "RQ5: Patient Segmentation",
+        "Task_Type": "Clustering",
+        "Best_Model": f"K-Means (k={FINAL_K})",
+        "Primary_Metric": "Silhouette Score",
+        "Score": cluster_evaluation.loc[
+            cluster_evaluation["Number_of_Clusters"] == FINAL_K,
+            "Silhouette_Score"
+        ].iloc[0]
+    }
+])
+
+print("Consolidated Project Results:")
+display(project_summary.round(4))
+```
